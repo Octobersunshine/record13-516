@@ -8,6 +8,12 @@ import (
 	"reconciliation/wechat"
 )
 
+const DefaultGraceMinutes = 0
+
+type ReconcileOptions struct {
+	GraceMinutes int
+}
+
 type ReconciliationService struct {
 	wechatSvc *wechat.ReconciliationService
 	alipaySvc *alipay.ReconciliationService
@@ -39,18 +45,47 @@ func (s *ReconciliationService) ParseAlipayBillFile(filePath string) ([]*model.T
 }
 
 func (s *ReconciliationService) Reconcile(date string, wechatRecords, alipayRecords []*model.TradeRecord) *model.ReconciliationResult {
-	result := &model.ReconciliationResult{
-		Date:          date,
-		WechatRecords: wechatRecords,
-		AlipayRecords: alipayRecords,
-	}
+	return s.ReconcileWithOptions(date, wechatRecords, alipayRecords, ReconcileOptions{
+		GraceMinutes: DefaultGraceMinutes,
+	})
+}
+
+func (s *ReconciliationService) ReconcileWithOptions(date string, wechatRecords, alipayRecords []*model.TradeRecord, opts ReconcileOptions) *model.ReconciliationResult {
+	grace := opts.GraceMinutes
+
+	var filteredWechat []*model.TradeRecord
+	var filteredAlipay []*model.TradeRecord
 
 	if wechatRecords != nil {
-		result.WechatSummary = wechat.Summarize(wechatRecords, date)
+		filtered, err := wechat.FilterByDate(wechatRecords, date, grace)
+		if err == nil {
+			filteredWechat = filtered
+		} else {
+			filteredWechat = wechatRecords
+		}
 	}
 
 	if alipayRecords != nil {
-		result.AlipaySummary = alipay.Summarize(alipayRecords, date)
+		filtered, err := alipay.FilterByDate(alipayRecords, date, grace)
+		if err == nil {
+			filteredAlipay = filtered
+		} else {
+			filteredAlipay = alipayRecords
+		}
+	}
+
+	result := &model.ReconciliationResult{
+		Date:          date,
+		WechatRecords: filteredWechat,
+		AlipayRecords: filteredAlipay,
+	}
+
+	if filteredWechat != nil {
+		result.WechatSummary = wechat.Summarize(filteredWechat, date)
+	}
+
+	if filteredAlipay != nil {
+		result.AlipaySummary = alipay.Summarize(filteredAlipay, date)
 	}
 
 	result.CombinedSummary = s.combineSummaries(result.WechatSummary, result.AlipaySummary, date)

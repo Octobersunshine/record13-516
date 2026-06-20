@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"reconciliation/model"
+	"reconciliation/pkg/timeutil"
 )
 
 type ReconciliationService struct {
@@ -223,13 +224,24 @@ func parseAlipayTime(timeStr string) (time.Time, error) {
 		"2006-01-02 15:04",
 		"2006年01月02日 15:04:05",
 	}
-	for _, layout := range layouts {
-		t, err := time.ParseInLocation(layout, timeStr, time.Local)
-		if err == nil {
-			return t, nil
+	return timeutil.ParseTimeMultiLayout(timeStr, layouts)
+}
+
+func FilterByDate(records []*model.TradeRecord, dateStr string, graceMinutes int) ([]*model.TradeRecord, error) {
+	start, end, err := timeutil.DateRangeWithGrace(dateStr, timeutil.DateRangeOption{
+		GracePeriodMinutes: graceMinutes,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("parse date failed: %w", err)
+	}
+
+	filtered := make([]*model.TradeRecord, 0, len(records))
+	for _, rec := range records {
+		if timeutil.IsInRange(rec.TradeTime, start, end) {
+			filtered = append(filtered, rec)
 		}
 	}
-	return time.Time{}, fmt.Errorf("parse time failed: %s", timeStr)
+	return filtered, nil
 }
 
 func parseAmount(amountStr string) int64 {

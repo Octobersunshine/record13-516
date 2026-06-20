@@ -4,12 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"time"
+	"strconv"
 
+	"reconciliation/alipay"
 	"reconciliation/model"
+	"reconciliation/pkg/timeutil"
 	"reconciliation/service"
 	"reconciliation/wechat"
-	"reconciliation/alipay"
 )
 
 type Handler struct {
@@ -28,9 +29,17 @@ type Response struct {
 
 type SummaryResponse struct {
 	Date          string       `json:"date"`
+	DateRange     *DateRangeInfo `json:"date_range,omitempty"`
 	WechatSummary *SummaryData `json:"wechat_summary,omitempty"`
 	AlipaySummary *SummaryData `json:"alipay_summary,omitempty"`
 	Combined      *SummaryData `json:"combined_summary,omitempty"`
+}
+
+type DateRangeInfo struct {
+	Start        string `json:"start"`
+	End          string `json:"end"`
+	GraceMinutes int    `json:"grace_minutes"`
+	Timezone     string `json:"timezone"`
 }
 
 type SummaryData struct {
@@ -56,14 +65,53 @@ type TradeRecordResponse struct {
 	Raw        map[string]string `json:"raw,omitempty"`
 }
 
+func normalizeDate(dateStr string) (string, error) {
+	if dateStr == "" {
+		return timeutil.FormatDate(timeutil.Now()), nil
+	}
+	t, err := timeutil.ParseDate(dateStr)
+	if err != nil {
+		return "", fmt.Errorf("invalid date format: %s", dateStr)
+	}
+	return timeutil.FormatDate(t), nil
+}
+
+func parseGraceMinutes(r *http.Request) int {
+	graceStr := r.FormValue("grace_minutes")
+	if graceStr == "" {
+		return 0
+	}
+	grace, err := strconv.Atoi(graceStr)
+	if err != nil || grace < 0 {
+		return 0
+	}
+	return grace
+}
+
+func buildDateRangeInfo(dateStr string, graceMinutes int) (*DateRangeInfo, error) {
+	start, end, err := timeutil.DateRangeWithGrace(dateStr, timeutil.DateRangeOption{
+		GracePeriodMinutes: graceMinutes,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &DateRangeInfo{
+		Start:        timeutil.FormatDateTime(start),
+		End:          timeutil.FormatDateTime(end),
+		GraceMinutes: graceMinutes,
+		Timezone:     "Asia/Shanghai (CST, UTC+8)",
+	}, nil
+}
+
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(Response{
 		Code:    0,
 		Message: "ok",
 		Data: map[string]string{
-			"status": "running",
-			"time":   time.Now().Format(time.RFC3339),
+			"status":   "running",
+			"time":     timeutil.FormatDateTime(timeutil.Now()),
+			"timezone": "Asia/Shanghai (CST, UTC+8)",
 		},
 	})
 }
@@ -81,6 +129,13 @@ func (h *Handler) ParseWechatBill(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
+	date, err := normalizeDate(r.FormValue("date"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	graceMinutes := parseGraceMinutes(r)
+
 	wechatSvc := wechat.NewReconciliationService(nil)
 	records, err := wechatSvc.ParseBillReader(file)
 	if err != nil {
@@ -88,18 +143,23 @@ func (h *Handler) ParseWechatBill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	date := r.FormValue("date")
-	if date == "" {
-		date = time.Now().Format("2006-01-02")
+	filteredRecords, err := wechat.FilterByDate(records, date, graceMinutes)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("filter records by date failed: %v", err))
+		return
 	}
 
-	summary := service.SummarizeWechat(records, date)
+	dateRangeInfo, _ := buildDateRangeInfo(date, graceMinutes)
+	summary := service.SummarizeWechat(filteredRecords, date)
 
 	writeSuccess(w, map[string]interface{}{
-		"date":    date,
-		"records": convertRecords(records),
-		"count":   len(records),
-		"summary": convertSummary(summary),
+		"date":                date,
+		"date_range":          dateRangeInfo,
+		"records":             convertRecords(filteredRecords),
+		"count":               len(filteredRecords),
+		"total_parsed_count":  len(records),
+		"filtered_out_count":  len(records) - len(filteredRecords),
+		"summary":             convertSummary(summary),
 	})
 }
 
@@ -116,6 +176,13 @@ func (h *Handler) ParseAlipayBill(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
+	date, err := normalizeDate(r.FormValue("date"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	graceMinutes := parseGraceMinutes(r)
+
 	alipaySvc := alipay.NewReconciliationService(nil)
 	records, err := alipaySvc.ParseBillReader(file)
 	if err != nil {
@@ -123,18 +190,23 @@ func (h *Handler) ParseAlipayBill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	date := r.FormValue("date")
-	if date == "" {
-		date = time.Now().Format("2006-01-02")
+	filteredRecords, err := alipay.FilterByDate(records, date, graceMinutes)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("filter records by date failed: %v", err))
+		return
 	}
 
-	summary := service.SummarizeAlipay(records, date)
+	dateRangeInfo, _ := buildDateRangeInfo(date, graceMinutes)
+	summary := service.SummarizeAlipay(filteredRecords, date)
 
 	writeSuccess(w, map[string]interface{}{
-		"date":    date,
-		"records": convertRecords(records),
-		"count":   len(records),
-		"summary": convertSummary(summary),
+		"date":                date,
+		"date_range":          dateRangeInfo,
+		"records":             convertRecords(filteredRecords),
+		"count":               len(filteredRecords),
+		"total_parsed_count":  len(records),
+		"filtered_out_count":  len(records) - len(filteredRecords),
+		"summary":             convertSummary(summary),
 	})
 }
 
@@ -144,10 +216,12 @@ func (h *Handler) Reconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	date := r.FormValue("date")
-	if date == "" {
-		date = time.Now().Format("2006-01-02")
+	date, err := normalizeDate(r.FormValue("date"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
+	graceMinutes := parseGraceMinutes(r)
 
 	var wechatRecords []*model.TradeRecord
 	wechatFile, _, err := r.FormFile("wechat_file")
@@ -178,10 +252,14 @@ func (h *Handler) Reconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result := h.svc.Reconcile(date, wechatRecords, alipayRecords)
+	result := h.svc.ReconcileWithOptions(date, wechatRecords, alipayRecords, service.ReconcileOptions{
+		GraceMinutes: graceMinutes,
+	})
 
+	dateRangeInfo, _ := buildDateRangeInfo(date, graceMinutes)
 	resp := &SummaryResponse{
-		Date: result.Date,
+		Date:      result.Date,
+		DateRange: dateRangeInfo,
 	}
 	if result.WechatSummary != nil {
 		resp.WechatSummary = convertSummary(result.WechatSummary)
@@ -202,10 +280,12 @@ func (h *Handler) ReconcileDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	date := r.FormValue("date")
-	if date == "" {
-		date = time.Now().Format("2006-01-02")
+	date, err := normalizeDate(r.FormValue("date"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
+	graceMinutes := parseGraceMinutes(r)
 
 	var wechatRecords []*model.TradeRecord
 	wechatFile, _, err := r.FormFile("wechat_file")
@@ -236,10 +316,14 @@ func (h *Handler) ReconcileDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result := h.svc.Reconcile(date, wechatRecords, alipayRecords)
+	result := h.svc.ReconcileWithOptions(date, wechatRecords, alipayRecords, service.ReconcileOptions{
+		GraceMinutes: graceMinutes,
+	})
 
+	dateRangeInfo, _ := buildDateRangeInfo(date, graceMinutes)
 	resp := map[string]interface{}{
-		"date": result.Date,
+		"date":       result.Date,
+		"date_range": dateRangeInfo,
 		"summary": map[string]interface{}{
 			"wechat":   convertSummary(result.WechatSummary),
 			"alipay":   convertSummary(result.AlipaySummary),
@@ -294,7 +378,7 @@ func convertRecords(records []*model.TradeRecord) []*TradeRecordResponse {
 	for _, r := range records {
 		tradeTime := ""
 		if !r.TradeTime.IsZero() {
-			tradeTime = r.TradeTime.Format("2006-01-02 15:04:05")
+			tradeTime = timeutil.FormatDateTime(r.TradeTime)
 		}
 		result = append(result, &TradeRecordResponse{
 			TradeNo:    r.TradeNo,
