@@ -9,16 +9,21 @@ import (
 	"reconciliation/alipay"
 	"reconciliation/model"
 	"reconciliation/pkg/timeutil"
+	"reconciliation/platform"
 	"reconciliation/service"
 	"reconciliation/wechat"
 )
 
 type Handler struct {
-	svc *service.ReconciliationService
+	svc     *service.ReconciliationService
+	diffSvc *service.DiffService
 }
 
 func NewHandler(svc *service.ReconciliationService) *Handler {
-	return &Handler{svc: svc}
+	return &Handler{
+		svc:     svc,
+		diffSvc: service.NewDiffService(),
+	}
 }
 
 type Response struct {
@@ -393,4 +398,313 @@ func convertRecords(records []*model.TradeRecord) []*TradeRecordResponse {
 		})
 	}
 	return result
+}
+
+type DiffOrderResponse struct {
+	DiffID        string              `json:"diff_id"`
+	DiffType      string              `json:"diff_type"`
+	OutTradeNo    string              `json:"out_trade_no"`
+	TradeType     string              `json:"trade_type"`
+	Channel       string              `json:"channel"`
+	PlatformTrade *TradeRecordResponse `json:"platform_trade,omitempty"`
+	ChannelTrade  *TradeRecordResponse `json:"channel_trade,omitempty"`
+	AmountDiff    string              `json:"amount_diff"`
+	FeeDiff       string              `json:"fee_diff"`
+	Description   string              `json:"description"`
+	CreatedAt     string              `json:"created_at"`
+}
+
+type DiffResultResponse struct {
+	Date            string            `json:"date"`
+	Channel         string            `json:"channel"`
+	TotalDiffCount  int64             `json:"total_diff_count"`
+	TotalDiffAmount string            `json:"total_diff_amount"`
+	DiffOrders      []*DiffOrderResponse `json:"diff_orders"`
+	DiffSummary     map[string]int64  `json:"diff_summary"`
+	PlatformCount   int64             `json:"platform_count"`
+	ChannelCount    int64             `json:"channel_count"`
+	MatchedCount    int64             `json:"matched_count"`
+	MatchRate       string            `json:"match_rate"`
+}
+
+func (h *Handler) DiffWechat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	date, err := normalizeDate(r.FormValue("date"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	graceMinutes := parseGraceMinutes(r)
+
+	platformFile, _, err := r.FormFile("platform_file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("read platform file failed: %v", err))
+		return
+	}
+	defer platformFile.Close()
+
+	wechatFile, _, err := r.FormFile("wechat_file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("read wechat file failed: %v", err))
+		return
+	}
+	defer wechatFile.Close()
+
+	platSvc := platform.NewReconciliationService()
+	platRecords, err := platSvc.ParseBillReader(platformFile)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("parse platform bill failed: %v", err))
+		return
+	}
+
+	wechatSvc := wechat.NewReconciliationService(nil)
+	wechatRecords, err := wechatSvc.ParseBillReader(wechatFile)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("parse wechat bill failed: %v", err))
+		return
+	}
+
+	filteredPlat, _ := platform.FilterByDate(platRecords, date, graceMinutes)
+	filteredWechat, _ := wechat.FilterByDate(wechatRecords, date, graceMinutes)
+
+	opts := parseDiffOptions(r)
+	diffResult := h.diffSvc.Compare(filteredPlat, filteredWechat, "wechat", date, opts)
+
+	writeSuccess(w, convertDiffResult(diffResult))
+}
+
+func (h *Handler) DiffAlipay(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	date, err := normalizeDate(r.FormValue("date"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	graceMinutes := parseGraceMinutes(r)
+
+	platformFile, _, err := r.FormFile("platform_file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("read platform file failed: %v", err))
+		return
+	}
+	defer platformFile.Close()
+
+	alipayFile, _, err := r.FormFile("alipay_file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("read alipay file failed: %v", err))
+		return
+	}
+	defer alipayFile.Close()
+
+	platSvc := platform.NewReconciliationService()
+	platRecords, err := platSvc.ParseBillReader(platformFile)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("parse platform bill failed: %v", err))
+		return
+	}
+
+	alipaySvc := alipay.NewReconciliationService(nil)
+	alipayRecords, err := alipaySvc.ParseBillReader(alipayFile)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("parse alipay bill failed: %v", err))
+		return
+	}
+
+	filteredPlat, _ := platform.FilterByDate(platRecords, date, graceMinutes)
+	filteredAlipay, _ := alipay.FilterByDate(alipayRecords, date, graceMinutes)
+
+	opts := parseDiffOptions(r)
+	diffResult := h.diffSvc.Compare(filteredPlat, filteredAlipay, "alipay", date, opts)
+
+	writeSuccess(w, convertDiffResult(diffResult))
+}
+
+func (h *Handler) DiffAll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	date, err := normalizeDate(r.FormValue("date"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	graceMinutes := parseGraceMinutes(r)
+
+	platformFile, _, err := r.FormFile("platform_file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("read platform file failed: %v", err))
+		return
+	}
+	defer platformFile.Close()
+
+	platSvc := platform.NewReconciliationService()
+	platRecords, err := platSvc.ParseBillReader(platformFile)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("parse platform bill failed: %v", err))
+		return
+	}
+	filteredPlat, _ := platform.FilterByDate(platRecords, date, graceMinutes)
+
+	opts := parseDiffOptions(r)
+	result := make(map[string]interface{})
+
+	var wechatDiffResult *model.DiffResult
+	wechatFile, _, err := r.FormFile("wechat_file")
+	if err == nil {
+		defer wechatFile.Close()
+		wechatSvc := wechat.NewReconciliationService(nil)
+		wechatRecords, err := wechatSvc.ParseBillReader(wechatFile)
+		if err == nil {
+			filteredWechat, _ := wechat.FilterByDate(wechatRecords, date, graceMinutes)
+			wechatDiffResult = h.diffSvc.Compare(filteredPlat, filteredWechat, "wechat", date, opts)
+			result["wechat_diff"] = convertDiffResult(wechatDiffResult)
+		}
+	}
+
+	var alipayDiffResult *model.DiffResult
+	alipayFile, _, err := r.FormFile("alipay_file")
+	if err == nil {
+		defer alipayFile.Close()
+		alipaySvc := alipay.NewReconciliationService(nil)
+		alipayRecords, err := alipaySvc.ParseBillReader(alipayFile)
+		if err == nil {
+			filteredAlipay, _ := alipay.FilterByDate(alipayRecords, date, graceMinutes)
+			alipayDiffResult = h.diffSvc.Compare(filteredPlat, filteredAlipay, "alipay", date, opts)
+			result["alipay_diff"] = convertDiffResult(alipayDiffResult)
+		}
+	}
+
+	if wechatDiffResult == nil && alipayDiffResult == nil {
+		writeError(w, http.StatusBadRequest, "at least one channel file is required (wechat_file or alipay_file)")
+		return
+	}
+
+	combinedTotalDiff := int64(0)
+	combinedDiffAmount := int64(0)
+	if wechatDiffResult != nil {
+		combinedTotalDiff += wechatDiffResult.TotalDiffCount
+		combinedDiffAmount += wechatDiffResult.TotalDiffAmount
+	}
+	if alipayDiffResult != nil {
+		combinedTotalDiff += alipayDiffResult.TotalDiffCount
+		combinedDiffAmount += alipayDiffResult.TotalDiffAmount
+	}
+
+	result["date"] = date
+	result["platform_count"] = int64(len(filteredPlat))
+	result["total_diff_count"] = combinedTotalDiff
+	result["total_diff_amount"] = service.FormatAmount(combinedDiffAmount)
+
+	writeSuccess(w, result)
+}
+
+func parseDiffOptions(r *http.Request) service.DiffOptions {
+	opts := service.DefaultDiffOptions()
+
+	if val := r.FormValue("check_status"); val == "true" || val == "1" {
+		opts.CheckStatus = true
+	}
+	if val := r.FormValue("check_fee"); val == "false" || val == "0" {
+		opts.CheckFee = false
+	}
+	if val := r.FormValue("check_type"); val == "false" || val == "0" {
+		opts.CheckType = false
+	}
+
+	if amountTolStr := r.FormValue("amount_tolerance"); amountTolStr != "" {
+		if tol, err := strconv.ParseFloat(amountTolStr, 64); err == nil {
+			opts.AmountTolerance = int64(tol * 100)
+		}
+	}
+	if feeTolStr := r.FormValue("fee_tolerance"); feeTolStr != "" {
+		if tol, err := strconv.ParseFloat(feeTolStr, 64); err == nil {
+			opts.FeeTolerance = int64(tol * 100)
+		}
+	}
+
+	return opts
+}
+
+func convertDiffResult(result *model.DiffResult) *DiffResultResponse {
+	if result == nil {
+		return nil
+	}
+
+	diffOrders := make([]*DiffOrderResponse, 0, len(result.DiffOrders))
+	for _, d := range result.DiffOrders {
+		diffOrders = append(diffOrders, convertDiffOrder(d))
+	}
+
+	diffSummary := make(map[string]int64)
+	for k, v := range result.DiffSummary {
+		diffSummary[string(k)] = v
+	}
+
+	return &DiffResultResponse{
+		Date:            result.Date,
+		Channel:         result.Channel,
+		TotalDiffCount:  result.TotalDiffCount,
+		TotalDiffAmount: service.FormatAmount(result.TotalDiffAmount),
+		DiffOrders:      diffOrders,
+		DiffSummary:     diffSummary,
+		PlatformCount:   result.PlatformCount,
+		ChannelCount:    result.ChannelCount,
+		MatchedCount:    result.MatchedCount,
+		MatchRate:       fmt.Sprintf("%.2f%%", result.MatchRate),
+	}
+}
+
+func convertDiffOrder(diff *model.DiffOrder) *DiffOrderResponse {
+	if diff == nil {
+		return nil
+	}
+	resp := &DiffOrderResponse{
+		DiffID:      diff.DiffID,
+		DiffType:    string(diff.DiffType),
+		OutTradeNo:  diff.OutTradeNo,
+		TradeType:   string(diff.TradeType),
+		Channel:     diff.Channel,
+		AmountDiff:  service.FormatAmount(diff.AmountDiff),
+		FeeDiff:     service.FormatAmount(diff.FeeDiff),
+		Description: diff.Description,
+		CreatedAt:   timeutil.FormatDateTime(diff.CreatedAt),
+	}
+	if diff.PlatformTrade != nil {
+		resp.PlatformTrade = convertSingleRecord(diff.PlatformTrade)
+	}
+	if diff.ChannelTrade != nil {
+		resp.ChannelTrade = convertSingleRecord(diff.ChannelTrade)
+	}
+	return resp
+}
+
+func convertSingleRecord(r *model.TradeRecord) *TradeRecordResponse {
+	if r == nil {
+		return nil
+	}
+	tradeTime := ""
+	if !r.TradeTime.IsZero() {
+		tradeTime = timeutil.FormatDateTime(r.TradeTime)
+	}
+	return &TradeRecordResponse{
+		TradeNo:    r.TradeNo,
+		OutTradeNo: r.OutTradeNo,
+		TradeType:  string(r.TradeType),
+		Amount:     service.FormatAmount(r.Amount),
+		TradeTime:  tradeTime,
+		Status:     r.Status,
+		PayChannel: r.PayChannel,
+		Fee:        service.FormatAmount(r.Fee),
+		Raw:        r.Raw,
+	}
 }

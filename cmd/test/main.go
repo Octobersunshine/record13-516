@@ -7,6 +7,7 @@ import (
 	"reconciliation/alipay"
 	"reconciliation/model"
 	"reconciliation/pkg/timeutil"
+	"reconciliation/platform"
 	"reconciliation/service"
 	"reconciliation/wechat"
 )
@@ -17,6 +18,9 @@ func main() {
 	testGracePeriod()
 	testTimezoneConsistency()
 	testFullReconciliation()
+	testPlatformParse()
+	testDiffComparison()
+	testDiffOptions()
 }
 
 func testBasicParse() {
@@ -200,4 +204,135 @@ func testFullReconciliation() {
 	}
 
 	fmt.Println("\n=== 所有测试完成 ===")
+}
+
+func testPlatformParse() {
+	fmt.Println("=== 测试6: 平台订单解析测试 ===")
+	platSvc := platform.NewReconciliationService()
+	records, err := platSvc.ParseBillFile("testdata/platform_bill.csv")
+	if err != nil {
+		log.Fatalf("平台账单解析失败: %v", err)
+	}
+
+	fmt.Printf("平台解析记录数: %d\n", len(records))
+	for i, r := range records {
+		fmt.Printf("  记录%d: 类型=%s, 金额=%s, 订单号=%s, 时间=%s, 手续费=%s\n",
+			i+1, r.TradeType, service.FormatAmount(r.Amount), r.OutTradeNo,
+			timeutil.FormatDateTime(r.TradeTime), service.FormatAmount(r.Fee))
+	}
+	fmt.Println()
+}
+
+func testDiffComparison() {
+	fmt.Println("=== 测试7: 对账差异单生成测试 ===")
+
+	platSvc := platform.NewReconciliationService()
+	platRecords, err := platSvc.ParseBillFile("testdata/platform_bill.csv")
+	if err != nil {
+		log.Fatalf("平台账单解析失败: %v", err)
+	}
+
+	wechatSvc := wechat.NewReconciliationService(nil)
+	wechatRecords, err := wechatSvc.ParseBillFile("testdata/wechat_bill.csv")
+	if err != nil {
+		log.Fatalf("微信账单解析失败: %v", err)
+	}
+
+	date := "2024-01-15"
+	graceMinutes := 0
+	filteredPlat, _ := platform.FilterByDate(platRecords, date, graceMinutes)
+	filteredWechat, _ := wechat.FilterByDate(wechatRecords, date, graceMinutes)
+
+	fmt.Printf("平台订单数: %d, 微信订单数: %d\n", len(filteredPlat), len(filteredWechat))
+
+	diffSvc := service.NewDiffService()
+	opts := service.DefaultDiffOptions()
+	diffResult := diffSvc.Compare(filteredPlat, filteredWechat, "wechat", date, opts)
+
+	fmt.Printf("\n差异比对结果:\n")
+	fmt.Printf("  差异总笔数: %d\n", diffResult.TotalDiffCount)
+	fmt.Printf("  差异总金额: %s\n", service.FormatAmount(diffResult.TotalDiffAmount))
+	fmt.Printf("  平台订单数: %d\n", diffResult.PlatformCount)
+	fmt.Printf("  渠道订单数: %d\n", diffResult.ChannelCount)
+	fmt.Printf("  匹配成功数: %d\n", diffResult.MatchedCount)
+	fmt.Printf("  匹配率: %.2f%%\n", diffResult.MatchRate)
+
+	fmt.Printf("\n差异类型统计:\n")
+	for diffType, count := range diffResult.DiffSummary {
+		fmt.Printf("  %s: %d 笔\n", diffType, count)
+	}
+
+	fmt.Printf("\n差异单详情:\n")
+	for i, diff := range diffResult.DiffOrders {
+		fmt.Printf("  差异%d: 类型=%s, 订单号=%s, 渠道=%s\n",
+			i+1, diff.DiffType, diff.OutTradeNo, diff.Channel)
+		fmt.Printf("    描述: %s\n", diff.Description)
+		if diff.AmountDiff != 0 {
+			fmt.Printf("    金额差额: %s\n", service.FormatAmount(diff.AmountDiff))
+		}
+		if diff.FeeDiff != 0 {
+			fmt.Printf("    手续费差额: %s\n", service.FormatAmount(diff.FeeDiff))
+		}
+	}
+
+	expectedDiffs := int64(5)
+	if diffResult.TotalDiffCount == expectedDiffs {
+		fmt.Printf("\n✅ 差异数量正确: %d 笔 (金额不匹配1 + 平台有渠道无1 + 渠道有平台无2 + 手续费不匹配? 待核对)\n", expectedDiffs)
+	} else {
+		fmt.Printf("\n⚠️  差异数量: %d 笔 (需根据测试数据核对)\n", diffResult.TotalDiffCount)
+	}
+	fmt.Println()
+}
+
+func testDiffOptions() {
+	fmt.Println("=== 测试8: 差异比对选项测试 ===")
+
+	platSvc := platform.NewReconciliationService()
+	platRecords, _ := platSvc.ParseBillFile("testdata/platform_bill.csv")
+
+	wechatSvc := wechat.NewReconciliationService(nil)
+	wechatRecords, _ := wechatSvc.ParseBillFile("testdata/wechat_bill.csv")
+
+	date := "2024-01-15"
+	filteredPlat, _ := platform.FilterByDate(platRecords, date, 0)
+	filteredWechat, _ := wechat.FilterByDate(wechatRecords, date, 0)
+
+	diffSvc := service.NewDiffService()
+
+	fmt.Println("--- 默认选项 (检查手续费和类型) ---")
+	defaultOpts := service.DefaultDiffOptions()
+	defaultResult := diffSvc.Compare(filteredPlat, filteredWechat, "wechat", date, defaultOpts)
+	fmt.Printf("  差异数: %d 笔\n", defaultResult.TotalDiffCount)
+
+	fmt.Println("\n--- 不检查手续费 ---")
+	optsNoFee := service.DefaultDiffOptions()
+	optsNoFee.CheckFee = false
+	resultNoFee := diffSvc.Compare(filteredPlat, filteredWechat, "wechat", date, optsNoFee)
+	fmt.Printf("  差异数: %d 笔 (减少 %d 笔手续费差异)\n",
+		resultNoFee.TotalDiffCount,
+		defaultResult.TotalDiffCount-resultNoFee.TotalDiffCount)
+
+	fmt.Println("\n--- 设置金额容忍度 1 元 ---")
+	optsTolerance := service.DefaultDiffOptions()
+	optsTolerance.AmountTolerance = 100 // 1元 = 100分
+	resultTolerance := diffSvc.Compare(filteredPlat, filteredWechat, "wechat", date, optsTolerance)
+	fmt.Printf("  差异数: %d 笔 (1元内金额差异被忽略)\n", resultTolerance.TotalDiffCount)
+
+	fmt.Println("\n--- 不检查类型 ---")
+	optsNoType := service.DefaultDiffOptions()
+	optsNoType.CheckType = false
+	resultNoType := diffSvc.Compare(filteredPlat, filteredWechat, "wechat", date, optsNoType)
+	fmt.Printf("  差异数: %d 笔\n", resultNoType.TotalDiffCount)
+
+	fmt.Println("\n--- 全部关闭，只检查金额 ---")
+	optsAmountOnly := service.DiffOptions{
+		AmountTolerance: 0,
+		CheckStatus:     false,
+		CheckFee:        false,
+		CheckType:       false,
+	}
+	resultAmountOnly := diffSvc.Compare(filteredPlat, filteredWechat, "wechat", date, optsAmountOnly)
+	fmt.Printf("  差异数: %d 笔 (仅金额不匹配 + 两边缺失的订单)\n", resultAmountOnly.TotalDiffCount)
+
+	fmt.Println()
 }

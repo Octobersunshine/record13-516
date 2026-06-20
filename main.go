@@ -45,6 +45,9 @@ func main() {
 	mux.HandleFunc("/api/alipay/bill/parse", h.ParseAlipayBill)
 	mux.HandleFunc("/api/reconcile", h.Reconcile)
 	mux.HandleFunc("/api/reconcile/detail", h.ReconcileDetail)
+	mux.HandleFunc("/api/diff/wechat", h.DiffWechat)
+	mux.HandleFunc("/api/diff/alipay", h.DiffAlipay)
+	mux.HandleFunc("/api/diff/all", h.DiffAll)
 
 	addr := fmt.Sprintf(":%s", *port)
 	log.Printf("Server starting on %s", addr)
@@ -54,6 +57,9 @@ func main() {
 	log.Printf("  POST /api/alipay/bill/parse")
 	log.Printf("  POST /api/reconcile")
 	log.Printf("  POST /api/reconcile/detail")
+	log.Printf("  POST /api/diff/wechat")
+	log.Printf("  POST /api/diff/alipay")
+	log.Printf("  POST /api/diff/all")
 
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatalf("Server failed to start: %v", err)

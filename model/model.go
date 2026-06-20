@@ -64,3 +64,41 @@ type AlipayConfig struct {
 	AppCertSN  string
 	AlipayRootCertSN string
 }
+
+type DiffType string
+
+const (
+	DiffTypeAmountMismatch   DiffType = "AMOUNT_MISMATCH"
+	DiffTypeStatusMismatch   DiffType = "STATUS_MISMATCH"
+	DiffTypeFeeMismatch      DiffType = "FEE_MISMATCH"
+	DiffTypePlatformOnly     DiffType = "PLATFORM_ONLY"
+	DiffTypeChannelOnly      DiffType = "CHANNEL_ONLY"
+	DiffTypeTypeMismatch     DiffType = "TYPE_MISMATCH"
+)
+
+type DiffOrder struct {
+	DiffID       string
+	DiffType     DiffType
+	OutTradeNo   string
+	TradeType    TradeType
+	Channel      string
+	PlatformTrade *TradeRecord
+	ChannelTrade  *TradeRecord
+	AmountDiff   int64
+	FeeDiff      int64
+	Description  string
+	CreatedAt    time.Time
+}
+
+type DiffResult struct {
+	Date           string
+	Channel        string
+	TotalDiffCount int64
+	TotalDiffAmount int64
+	DiffOrders     []*DiffOrder
+	DiffSummary    map[DiffType]int64
+	PlatformCount  int64
+	ChannelCount   int64
+	MatchedCount   int64
+	MatchRate      float64
+}
